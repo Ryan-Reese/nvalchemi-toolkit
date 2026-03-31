@@ -1,0 +1,12 @@
+#!/bin/bash
+export SCRATCH_PATH=~/scratch
+export ENROOT_ALLOW_SUPERUSER=yes
+export ENROOT_DATA_PATH=${SCRATCH_PATH}/enroot-data
+export ENROOT_CACHE_PATH=${SCRATCH_PATH}/enroot-cache
+
+srun \
+    --job-name=nvalchemi-toolkit \
+    --time=4:00:00 \
+    --constraint=aarch64 \
+    --gres=gpu:2 \
+    --pty $SHELL
