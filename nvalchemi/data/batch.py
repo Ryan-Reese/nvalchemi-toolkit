@@ -731,6 +731,11 @@ class Batch(DataMixin):
         """
         device = self.device
         n = src_batch.num_graphs
+        if src_batch.device != device:
+            raise RuntimeError(
+                f"src_batch device ({src_batch.device}) != buffer device ({device}); "
+                f"move source first with src_batch.to('{device}')"
+            )
         if mask.shape[0] != n:
             raise ValueError(f"mask shape {mask.shape[0]} != num_graphs {n}")
         mask = mask.to(device=device, dtype=torch.bool)
