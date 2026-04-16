@@ -55,7 +55,7 @@ import torch
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.dynamics import NVTLangevin
 from nvalchemi.dynamics.base import DynamicsStage
-from nvalchemi.hooks import BiasedPotentialHook, HookContext, NeighborListHook
+from nvalchemi.hooks import BiasedPotentialHook, HookContext
 from nvalchemi.models.lj import LennardJonesModelWrapper
 
 logging.basicConfig(level=logging.INFO)
@@ -75,7 +75,6 @@ model = LennardJonesModelWrapper(
     epsilon=LJ_EPSILON,
     sigma=LJ_SIGMA,
     cutoff=LJ_CUTOFF,
-    max_neighbors=32,
 )
 
 # %%
@@ -214,9 +213,6 @@ def my_bias_fn(batch: Batch) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 bias_hook = BiasedPotentialHook(bias_fn=my_bias_fn, stage=DynamicsStage.AFTER_COMPUTE)
-neighbor_hook = NeighborListHook(
-    model.model_config.neighbor_config, stage=DynamicsStage.BEFORE_COMPUTE
-)
 
 nvt_biased = NVTLangevin(
     model=model,
@@ -226,7 +222,8 @@ nvt_biased = NVTLangevin(
     n_steps=200,
     random_seed=7,
 )
-nvt_biased.register_hook(neighbor_hook)
+for hook in model.make_neighbor_hooks():
+    nvt_biased.register_hook(hook, stage=DynamicsStage.BEFORE_COMPUTE)
 nvt_biased.register_hook(bias_hook)
 
 # Track COM trajectory during the run.
@@ -271,7 +268,8 @@ nvt_unbiased = NVTLangevin(
     n_steps=200,
     random_seed=7,
 )
-nvt_unbiased.register_hook(neighbor_hook)
+for hook in model.make_neighbor_hooks():
+    nvt_unbiased.register_hook(hook, stage=DynamicsStage.BEFORE_COMPUTE)
 nvt_unbiased.register_hook(_COMRecorder(com_unbiased))
 batch_unbiased = nvt_unbiased.run(batch_unbiased)
 print(f"Unbiased run complete: {nvt_unbiased.step_count} steps")

@@ -242,7 +242,7 @@ class TestInstantiation:
 
     def test_default_model_config(self, wrapper):
         assert "forces" in wrapper.model_config.active_outputs
-        assert "stress" in wrapper.model_config.active_outputs
+        assert "stress" not in wrapper.model_config.active_outputs
 
     def test_node_emb_buffer_shape(self, wrapper):
         # [max_z + 1, num_elements] = [9, 3] for atomic_numbers=[1, 6, 8]
@@ -643,7 +643,6 @@ class TestFromCheckpointErrors:
                 raise ImportError("no module named cuequivariance")
             return real_import(name, *args, **kwargs)
 
-        # Patch the checkpoint loader to return mock_model without network access.
         monkeypatch.setattr(
             "mace.calculators.foundations_models.download_mace_mp_checkpoint",
             lambda _: "unused",
@@ -760,7 +759,6 @@ class TestRealCheckpoint:
         except Exception as e:
             pytest.skip(f"Checkpoint unavailable: {e}")
         ae = w.model.atomic_energies_fn.atomic_energies
-        # atomic_energies must match the model dtype so matmul with node_attrs works
         assert ae.dtype == torch.float32
 
     def test_export_and_reload(self, real_wrapper_cpu, tmp_path):

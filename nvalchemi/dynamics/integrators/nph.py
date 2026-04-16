@@ -47,6 +47,7 @@ from nvalchemi.dynamics._ops.npt_nph import (
     npt_position_update,
 )
 from nvalchemi.dynamics._ops.thermostat_utils import compute_kinetic_energy
+from nvalchemi.dynamics._units import fs_to_internal_time
 from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.dynamics.hooks._utils import KB_EV
 
@@ -69,13 +70,13 @@ class NPH(BaseDynamics):
         The neural network potential model.  Must produce ``"stress"``
         output in addition to forces.
     dt : float or torch.Tensor
-        Integration timestep ``[M]`` or scalar.
+        Integration timestep in femtoseconds ``[M]`` or scalar.
     pressure : float or torch.Tensor
         Target pressure ``[M]`` (isotropic), ``[M, 3]`` (anisotropic),
         or ``[M, 3, 3]`` (triclinic).  Scalar is broadcast to ``[M]``
         isotropic.
     barostat_time : float or torch.Tensor
-        Barostat coupling time τ_P ``[M]`` or scalar.
+        Barostat coupling time τ_P in femtoseconds ``[M]`` or scalar.
     pressure_coupling : {"isotropic", "anisotropic", "triclinic"}
         Pressure control mode.  Default ``"isotropic"``.
     n_steps : int, optional
@@ -119,9 +120,9 @@ class NPH(BaseDynamics):
             convergence_hook=convergence_hook,
             **kwargs,
         )
-        self._dt_init = dt
+        self._dt_init = fs_to_internal_time(dt)
         self._pressure_init = pressure
-        self._barostat_time_init = barostat_time
+        self._barostat_time_init = fs_to_internal_time(barostat_time)
         self.pressure_coupling = pressure_coupling
 
     def _init_state(self, batch: Batch) -> None:
@@ -138,6 +139,8 @@ class NPH(BaseDynamics):
         kT_est = torch.full((M,), 300.0 * KB_EV, dtype=dtype, device=dev)
         W = torch.zeros(M, dtype=dtype, device=dev)
         compute_barostat_mass(kT_est, barostat_time, num_atoms_per_system, W)
+        if self.pressure_coupling != "isotropic":
+            W = W / 3
         self._state = _make_state_batch(
             {
                 "dt": dt,
@@ -167,6 +170,8 @@ class NPH(BaseDynamics):
         )
         W = torch.zeros(n, dtype=dtype, device=dev)
         compute_barostat_mass(kT_est, barostat_time, num_atoms_per_system, W)
+        if self.pressure_coupling != "isotropic":
+            W = W / 3
         return _make_state_batch(
             {
                 "dt": _to_per_system(self._dt_init, n, dev, dtype),
@@ -189,10 +194,13 @@ class NPH(BaseDynamics):
 
     def _compute_P(self, batch: Batch, volumes: torch.Tensor) -> torch.Tensor:
         """Compute the instantaneous pressure tensor."""
+        # batch.stress is Cauchy stress W/V (eV/A^3).
+        # compute_pressure_tensor expects virial W (eV).
+        virial = batch.stress * volumes.view(-1, 1, 1)
         return compute_pressure_tensor(
             batch.velocities,
             batch.atomic_masses,
-            batch.stress,
+            virial,
             batch.cell,
             self._state.kinetic_tensors,
             self._state.pressure_tensors,
@@ -244,6 +252,7 @@ class NPH(BaseDynamics):
             self._state.dt,
             batch.batch_idx.int(),
             cells_inv,
+            self.pressure_coupling,
         )
         npt_position_update(
             batch.positions,
@@ -281,6 +290,7 @@ class NPH(BaseDynamics):
             self._state.dt,
             batch.batch_idx.int(),
             cells_inv,
+            self.pressure_coupling,
         )
         P_inst = self._compute_P(batch, volumes)
         KE = self._compute_ke(batch)

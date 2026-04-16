@@ -65,7 +65,6 @@ from nvalchemi.data import AtomicData, Batch
 from nvalchemi.dynamics import NVTLangevin
 from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.dynamics.hooks import LoggingHook
-from nvalchemi.hooks import NeighborListHook
 from nvalchemi.models.lj import LennardJonesModelWrapper
 
 # %%
@@ -94,7 +93,6 @@ model = LennardJonesModelWrapper(
     epsilon=LJ_EPSILON,
     sigma=LJ_SIGMA,
     cutoff=LJ_CUTOFF,
-    max_neighbors=MAX_NEIGHBORS,
 )
 
 N_SIDE = 3
@@ -186,11 +184,8 @@ nvt = NVTLangevin(
     n_steps=500,
 )
 
-nvt.register_hook(
-    NeighborListHook(
-        model.model_config.neighbor_config, stage=DynamicsStage.BEFORE_COMPUTE
-    )
-)
+for hook in model.make_neighbor_hooks():
+    nvt.register_hook(hook, stage=DynamicsStage.BEFORE_COMPUTE)
 
 with LoggingHook(backend="custom", writer_fn=_loguru_writer, frequency=20) as log_hook:
     nvt.register_hook(log_hook)

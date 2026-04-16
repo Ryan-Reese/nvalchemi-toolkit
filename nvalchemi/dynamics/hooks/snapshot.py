@@ -169,9 +169,31 @@ class ConvergedSnapshotHook:
         self.frequency = frequency
         self.stage = stage
 
+    # Neighbor data keys to strip before writing to the sink.
+    # Neighbor tensors are ephemeral (rebuilt by NeighborListHook each step)
+    # and their K-dimension can change between rebuilds due to adaptive
+    # sizing, causing shape mismatches when the sink concatenates snapshots.
+    _NEIGHBOR_KEYS = frozenset(
+        {
+            "neighbor_matrix",
+            "num_neighbors",
+            "neighbor_matrix_shifts",
+            "neighbor_list",
+            "neighbor_list_shifts",
+        }
+    )
+
     @torch.compiler.disable
     def _write_converged(self, batch: Batch, mask: torch.Tensor | None) -> None:
         """Write converged samples to the configured sink.
+
+        Neighbor data is stripped before writing because its K-dimension
+        can vary between adaptive rebuilds, causing shape mismatches when
+        the sink later concatenates snapshots into a single Batch.
+
+        A sub-batch is created via :meth:`Batch.index_select` so the
+        live ``batch`` object is never mutated — downstream hooks that
+        read neighbor data after ``ON_CONVERGE`` see an intact batch.
 
         Parameters
         ----------
@@ -182,7 +204,19 @@ class ConvergedSnapshotHook:
         """
         if mask is None or not mask.any():
             return
-        self.sink.write(batch, mask=mask)
+        # Build a sub-batch of only converged systems so we never
+        # mutate the live batch object.
+        indices = torch.nonzero(mask, as_tuple=True)[0]
+        _ = batch.batch_ptr  # trigger lazy init for SegmentedLevelStorage
+        sub_batch = batch.index_select(indices)
+        # Strip ephemeral neighbor data before writing to avoid
+        # variable-width concatenation failures in the sink.
+        for key in self._NEIGHBOR_KEYS:
+            try:
+                del sub_batch[key]
+            except (KeyError, IndexError):
+                pass
+        self.sink.write(sub_batch)
 
     def __call__(self, ctx: HookContext, stage: Enum) -> None:
         """Write converged samples to the configured sink."""

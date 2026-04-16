@@ -114,13 +114,11 @@ lj_model = LennardJonesModelWrapper(
     epsilon=LJ_EPSILON,
     sigma=LJ_SIGMA,
     cutoff=LJ_CUTOFF,
-    max_neighbors=MAX_NEIGHBORS,
 )
 
 ewald_model = EwaldModelWrapper(
     cutoff=EWALD_CUTOFF,
     accuracy=1e-6,
-    max_neighbors=MAX_NEIGHBORS,
 )
 
 # Combine with the + operator.  This creates a PipelineModelWrapper where
@@ -168,7 +166,7 @@ iy = torch.arange(N_SIDE).repeat(N_SIDE).repeat_interleave(N_SIDE)
 iz = torch.arange(N_SIDE).repeat(N_SIDE * N_SIDE)
 parity = (ix + iy + iz) % 2  # 0 or 1
 charges_1d = torch.where(parity == 0, torch.tensor(1.0), torch.tensor(-1.0))
-charges = charges_1d.unsqueeze(-1)  # (N, 1) — required shape for AtomicData
+charges = charges_1d  # (N, ) — required shape for AtomicData
 
 atomic_numbers = torch.full((n_atoms,), 11, dtype=torch.long)  # all "Na"
 
@@ -217,7 +215,7 @@ nvt = NVTLangevin(
     random_seed=99,
 )
 
-for hook in combined.make_neighbor_hooks():
+for hook in combined.make_neighbor_hooks(max_neighbors=MAX_NEIGHBORS):
     nvt.register_hook(hook, stage=DynamicsStage.BEFORE_COMPUTE)
 nvt.register_hook(WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE))
 

@@ -75,15 +75,6 @@ from nvalchemi.models.base import (
 __all__ = ["AIMNet2Wrapper"]
 
 
-def __getattr__(name: str):
-    """Lazy re-export of AIMNet2Calculator as AIMNet2."""
-    if name == "AIMNet2":
-        from aimnet.calculators import AIMNet2Calculator
-
-        return AIMNet2Calculator
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 @OptionalDependency.AIMNET.require
 class AIMNet2Wrapper(nn.Module, BaseModelMixin):
     """Wrapper for AIMNet2 interatomic potentials.
@@ -116,7 +107,9 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
     model_config : ModelConfig
         Configuration with capability and runtime fields.
     model : nn.Module
-        The underlying AIMNet2 model.
+        The underlying AIMNet2 model. If you want your model
+        to be compiled, wrap with torch.compile(model, **kwargs)
+        before passing here.
     """
 
     model: nn.Module
@@ -170,7 +163,7 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
                 # max_neighbors left as None — NeighborListHook will
                 # auto-estimate via estimate_max_neighbors(cutoff).
             ),
-            active_outputs=outputs,
+            active_outputs={"energy", "forces", "charges"},
         )
 
     # ------------------------------------------------------------------
@@ -182,6 +175,8 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
         cls,
         checkpoint_path: str | Path,
         device: torch.device | str = "cpu",
+        compile_model: bool = False,
+        **compile_kwargs: Any,
     ) -> "AIMNet2Wrapper":
         """Load an AIMNet2 model and return a wrapped instance.
 
@@ -195,7 +190,11 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
             recognized by ``AIMNet2Calculator`` (e.g. ``"aimnet2"``).
         device : torch.device | str, optional
             Target device. Defaults to ``"cpu"``.
-
+        compile_model: bool, optional
+            Apply ``torch.compile``.  Sets eval mode and freezes parameters;
+            the model is **inference-only** after this step.
+        **compile_kwargs
+            Forwarded to ``torch.compile``.
         Returns
         -------
         AIMNet2Wrapper
@@ -207,7 +206,8 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
             device=str(device),
             needs_coulomb=False,
             needs_dispersion=False,
-            compile_model=False,
+            compile_model=compile_model,
+            compile_kwargs=compile_kwargs,
             train=False,
         )
         raw_model = calc.model

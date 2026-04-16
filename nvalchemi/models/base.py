@@ -75,16 +75,12 @@ class NeighborConfig(BaseModel):
         Verlet skin distance.  The neighbor list is only rebuilt when any atom
         has moved more than ``skin / 2`` since the last build.  Set to ``0.0``
         (default) to rebuild every step.
-    max_neighbors : int | None
-        Maximum number of neighbors per atom.  Required when
-        ``format=MATRIX``; ignored for ``COO``.
     """
 
     cutoff: float
     format: NeighborListFormat = NeighborListFormat.COO
     half_list: bool = False
     skin: float = 0.0
-    max_neighbors: int | None = None
 
 
 class ModelConfig(BaseModel):
@@ -342,8 +338,6 @@ class BaseModelMixin(abc.ABC):
             nc_str = f"cutoff={nc.cutoff}, format={nc.format.value}"
             if nc.half_list:
                 nc_str += ", half_list"
-            if nc.max_neighbors is not None:
-                nc_str += f", max_neighbors={nc.max_neighbors}"
             parts.append(f"neighbors=({nc_str})")
 
         return "\n".join(parts)
@@ -377,6 +371,56 @@ class BaseModelMixin(abc.ABC):
             If the model does not support embeddings computation
         """
         ...
+
+    def direct_derivative_keys(self) -> set[str]:
+        """Return output keys this model computes analytically in ``forward()``.
+
+        When this model participates in a pipeline autograd group, the
+        pipeline strips ``"forces"`` and ``"stress"`` from sub-model
+        ``active_outputs`` so it can compute them via autograd on the
+        summed energy.  Keys returned by this method are **kept** in
+        ``active_outputs`` — the pipeline collects them from the model
+        output and sums them with the autograd-derived derivatives.
+
+        Override this in models that produce analytical forces or stress
+        alongside an energy that carries autograd information (e.g.
+        Ewald/PME with ``hybrid_forces=True``).
+
+        Returns
+        -------
+        set[str]
+            Keys (e.g. ``{"forces", "stress"}``) that the model produces
+            analytically and should be summed with autograd derivatives.
+            Default: empty set (all derivatives come from autograd).
+        """
+        return set()
+
+    def set_config(self, key: str, value: Any) -> None:
+        """Set a mutable field on :attr:`model_config`.
+
+        Convenience method equivalent to
+        ``self.model_config.<key> = value`` with validation that the
+        field exists and is mutable.
+
+        Parameters
+        ----------
+        key : str
+            Name of a mutable ``ModelConfig`` field (e.g.
+            ``"active_outputs"``, ``"gradient_keys"``).
+        value
+            New value for the field.
+
+        Raises
+        ------
+        AttributeError
+            If *key* is not a field on :class:`ModelConfig`.
+        """
+        if not hasattr(self.model_config, key):
+            raise AttributeError(
+                f"ModelConfig has no field '{key}'.  "
+                f"Available fields: {list(self.model_config.model_fields)}"
+            )
+        setattr(self.model_config, key, value)
 
     def adapt_input(
         self, data: AtomicData | Batch | AtomsLike, **kwargs: Any
@@ -584,12 +628,18 @@ class BaseModelMixin(abc.ABC):
             ]
         )
 
-    def make_neighbor_hooks(self) -> list:
+    def make_neighbor_hooks(self, max_neighbors: int | None = None) -> list:
         """Return a list of :class:`~nvalchemi.hooks.NeighborListHook` instances
         for this model's neighbor configuration.
 
         Returns an empty list if the model does not require a neighbor list.
         Defers the import to avoid circular imports.
+
+        Parameters
+        ----------
+        max_neighbors : int | None, optional
+            Maximum neighbors per atom for MATRIX format.  When ``None``
+            (default), auto-estimated from the cutoff at first use.
         """
         from nvalchemi.dynamics.base import DynamicsStage  # noqa: PLC0415
         from nvalchemi.hooks import NeighborListHook  # noqa: PLC0415
@@ -597,4 +647,11 @@ class BaseModelMixin(abc.ABC):
         nc = self.model_config.neighbor_config
         if nc is None:
             return []
-        return [NeighborListHook(nc, skin=nc.skin, stage=DynamicsStage.BEFORE_COMPUTE)]
+        return [
+            NeighborListHook(
+                nc,
+                skin=nc.skin,
+                max_neighbors=max_neighbors,
+                stage=DynamicsStage.BEFORE_COMPUTE,
+            )
+        ]

@@ -99,7 +99,7 @@ the schema.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `outputs` | `frozenset({"energy"})` | All property names the model can produce. Well-known keys: `energies`, `forces`, `stresses`, `hessians`, `dipoles`, `charges`. |
+| `outputs` | `frozenset({"energy"})` | All property names the model can produce. Well-known keys: `energy`, `forces`, `stress`, `hessian`, `dipole`, `charges`. |
 | `autograd_outputs` | `frozenset()` | Subset of `outputs` computed via autograd (e.g. `{"forces"}` for conservative MLIP forces). Empty for analytical-force models. |
 | `autograd_inputs` | `frozenset({"positions"})` | Input keys that need `requires_grad_(True)` when any autograd output is requested. |
 | `required_inputs` | `frozenset()` | Extra inputs beyond `{positions, atomic_numbers}` that the model **requires** (error if missing). Neighbor-list keys are auto-derived from `neighbor_config`. |
@@ -137,16 +137,16 @@ cfg = ModelConfig(
     autograd_outputs=set(),   # forces computed by kernel, not autograd
     supports_pbc=True,
     needs_pbc=False,
-    neighbor_config=NeighborConfig(cutoff=8.5, format="matrix", max_neighbors=128),
+    neighbor_config=NeighborConfig(cutoff=8.5, format="matrix"),
 )
 
 # A model that requires charges as input (e.g. Ewald)
 cfg = ModelConfig(
     outputs={"energy", "forces", "stress"},
-    required_inputs={"node_charges"},
+    required_inputs={"charges"},
     needs_pbc=True,
     supports_pbc=True,
-    neighbor_config=NeighborConfig(cutoff=10.0, format="matrix", max_neighbors=256),
+    neighbor_config=NeighborConfig(cutoff=10.0, format="matrix"),
 )
 
 # A model with optional inputs (e.g. AIMNet2 — works with or without PBC)
@@ -190,6 +190,33 @@ production dynamics.
 
 This section walks through every method you need to implement, using
 {py:class}`~nvalchemi.models.demo.DemoModelWrapper` as the running example.
+
+### Required interface checklist
+
+Your wrapper class must provide the following.  Methods marked **abstract**
+will raise ``TypeError`` at instantiation if missing:
+
+| Method / Property | Abstract? | Classical potential stub |
+|---|---|---|
+| `model_config` attribute | — (enforced by post-init check) | Set `self.model_config = ModelConfig(...)` in `__init__` |
+| `embedding_shapes` (property) | **Yes** | `return {}` |
+| `compute_embeddings()` | **Yes** | `raise NotImplementedError` |
+| `adapt_input()` | No (has default) | Override to collect model-specific inputs |
+| `adapt_output()` | No (has default) | Override to map raw outputs |
+| `forward()` | No (inherit from nn.Module) | Implement the three-step pipeline |
+| `export_model()` | No (has default) | Override if needed |
+
+For classical potentials with no learned embeddings, stub both embedding
+methods:
+
+```python
+@property
+def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
+    return {}
+
+def compute_embeddings(self, data, **kwargs):
+    raise NotImplementedError("No embeddings for this model.")
+```
 
 ### Step 1 --- Create the wrapper class
 
@@ -311,12 +338,21 @@ The standard output shapes are:
 | `stress` | `[B, 3, 3]` | Per-graph stress tensor |
 | `hessians` | `[V, 3, 3]` | Per-atom Hessian |
 | `dipole` | `[B, 3]` | Per-graph dipole moment |
-| `charges` | `[V, 1]` | Per-atom partial charges |
+| `charges` | `[V]` | Per-atom partial charges |
 
-### Step 6 (optional) --- Implement `compute_embeddings`
+### Step 6 --- Implement `compute_embeddings`
 
-Extract intermediate representations and write them to the data structure
-**in-place**. This is used by active learning and other downstream consumers:
+This method is **abstract** — you must implement it even if your model has
+no learned embeddings.  For classical potentials, a one-line stub suffices:
+
+```python
+def compute_embeddings(self, data, **kwargs):
+    raise NotImplementedError("No embeddings for this model.")
+```
+
+For learned models, extract intermediate representations and write them to
+the data structure **in-place**. This is used by active learning and other
+downstream consumers:
 
 ```python
 def compute_embeddings(self, data: AtomicData | Batch, **kwargs) -> AtomicData | Batch:
@@ -357,11 +393,11 @@ Wire the three-step pipeline together:
 ```python
 def forward(self, data: AtomicData | Batch, **kwargs) -> ModelOutputs:
     model_inputs = self.adapt_input(data, **kwargs)
-    model_outputs = super().forward(**model_inputs)
+    model_outputs = self.model(**model_inputs)
     return self.adapt_output(model_outputs, data)
 ```
 
-`super().forward(**model_inputs)` calls the underlying `DemoModel.forward`
+`self.model(**model_inputs)` calls the underlying `DemoModel.forward`
 with the unpacked keyword arguments --- your original model is never modified.
 For additional flair, the ``@beartype.beartype`` decorator can be applied to
 the ``forward`` method, which will provide runtime type checking on the
@@ -499,7 +535,8 @@ lj = LennardJonesModelWrapper(epsilon=0.05, sigma=2.5, cutoff=8.0)
 ewald = EwaldModelWrapper(cutoff=8.0)
 
 combined = lj + ewald            # sums energies, forces, stresses
-combined = mace + dftd3 + ewald  # chains naturally (3 groups)
+# With more models:
+# combined = model_a + model_b + model_c  # chains naturally (3 groups)
 ```
 
 The result is a
@@ -538,13 +575,11 @@ from nvalchemi.models.pipeline import (
 )
 
 # AIMNet2 predicts charges + energy; Ewald uses those charges.
+# Both use the key "charges" — auto-wired, no explicit mapping needed.
 # Forces must backpropagate through both → shared autograd.
 pipe = PipelineModelWrapper(groups=[
     PipelineGroup(
-        steps=[
-            PipelineStep(aimnet2, wire={"charges": "node_charges"}),
-            ewald,
-        ],
+        steps=[aimnet2, ewald],
         use_autograd=True,
     ),
     PipelineGroup(steps=[dftd3]),
@@ -555,9 +590,8 @@ Key concepts:
 
 * **`PipelineStep(model, wire={...})`** --- wraps a model with an output
   rename mapping.  Only needed when a model's output key doesn't match the
-  downstream input key (e.g. model outputs `"charges"`, downstream expects
-  `"node_charges"`).  For models that don't need renaming, pass the bare
-  model directly.
+  downstream input key.  For models that don't need renaming (like AIMNet2 +
+  Ewald above where both use `"charges"`), pass the bare model directly.
 * **`PipelineGroup(steps=[...], use_autograd=True|False)`** --- a group
   of steps with a shared derivative strategy.
 * **Auto-wiring** --- if an upstream model's output key matches a
@@ -640,7 +674,7 @@ def forward(self, data, **kwargs):
 
     if compute_stresses:
         scaled_pos, scaled_cell, displacement = prepare_strain(
-            data.positions, data.cell, data.batch
+            data.positions, data.cell, data.batch_idx
         )
         # Run model on scaled tensors
         energy = self.model(scaled_pos, scaled_cell, ...)
@@ -680,9 +714,12 @@ wrap them:
 
 ```python
 # Hessian (second derivative of energy w.r.t. positions)
-hessian = torch.autograd.functional.hessian(
-    lambda pos: model(pos).sum(), data.positions
-)
+# Models expect a Batch, not raw positions — define a closure.
+def energy_fn(pos):
+    data.positions = pos
+    return model(data)["energy"].sum()
+
+hessian = torch.autograd.functional.hessian(energy_fn, data.positions)
 
 # Born effective charges (Jacobian of dipoles w.r.t. positions)
 dipoles = model(data)["dipole"]  # [B, 3]
@@ -775,7 +812,7 @@ strain trick or compute forces automatically --- your function has full
 control.  If you want stresses, use
 {py:func}`~nvalchemi.models._utils.prepare_strain` inside your function.
 
-### Neighbor list handling in composed models
+### Neighbor list handling and `make_neighbor_hooks()`
 
 All composition tiers handle neighbor lists transparently:
 
@@ -784,11 +821,41 @@ All composition tiers handle neighbor lists transparently:
    cutoff** across all sub-models, using MATRIX format if any sub-model
    needs it.
 2. `make_neighbor_hooks()` returns **one**
-   {py:class}`~nvalchemi.dynamics.hooks.NeighborListHook` at that max
+   {py:class}`~nvalchemi.hooks.NeighborListHook` at that max
    cutoff.
 3. Each sub-model's `adapt_input()` calls `prepare_neighbors_for_model()`
    which filters the max-cutoff neighbor list down to the model's own
    cutoff and converts formats as needed.
+
+**Choosing a registration pattern:**
+
+`make_neighbor_hooks()` works for both single models and composed models.
+For a single model it is equivalent to constructing a
+{py:class}`~nvalchemi.hooks.NeighborListHook` manually from the model's
+{py:class}`~nvalchemi.models.base.NeighborConfig`:
+
+```python
+# These two are equivalent for a single model:
+
+# (a) make_neighbor_hooks — recommended
+for hook in model.make_neighbor_hooks():
+    dynamics.register_hook(hook, stage=DynamicsStage.BEFORE_COMPUTE)
+
+# (b) manual construction — use when you need extra control (e.g. skin distance)
+from nvalchemi.hooks import NeighborListHook
+dynamics.register_hook(
+    NeighborListHook(model.model_config.neighbor_config, skin=0.5),
+    stage=DynamicsStage.BEFORE_COMPUTE,
+)
+```
+
+For **composed models** (pipeline), `composed.make_neighbor_hooks()`
+reads the already-synthesized maximum cutoff from the pipeline's
+`model_config.neighbor_config`.  Manual construction from
+`composed.model_config.neighbor_config` is equally valid.
+
+Hooks returned by `make_neighbor_hooks()` have `stage=None` by default —
+provide the stage when registering.
 
 ## How models integrate with dynamics
 
@@ -802,6 +869,8 @@ from nvalchemi.dynamics import DemoDynamics
 
 model = MyPotentialWrapper(hidden_dim=128)
 dynamics = DemoDynamics(model=model, n_steps=1000, dt=0.5)
+# DemoDynamics expects forces to exist on the batch.
+batch.forces = torch.zeros_like(batch.positions)
 dynamics.run(batch)
 ```
 

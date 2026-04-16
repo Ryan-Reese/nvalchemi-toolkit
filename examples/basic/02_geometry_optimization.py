@@ -51,7 +51,6 @@ from nvalchemi.data import AtomicData, Batch
 from nvalchemi.dynamics import FIRE
 from nvalchemi.dynamics.base import ConvergenceHook, DynamicsStage
 from nvalchemi.dynamics.hooks import LoggingHook
-from nvalchemi.hooks import NeighborListHook
 from nvalchemi.models.lj import LennardJonesModelWrapper
 
 # %%
@@ -81,12 +80,11 @@ model = LennardJonesModelWrapper(
     epsilon=LJ_EPSILON,
     sigma=LJ_SIGMA,
     cutoff=LJ_CUTOFF,
-    max_neighbors=MAX_NEIGHBORS,
 )
 
-neighbor_hook = NeighborListHook(
-    model.model_config.neighbor_config, stage=DynamicsStage.BEFORE_COMPUTE
-)
+# Neighbor list hook — make_neighbor_hooks() reads the cutoff and format
+# from the model config automatically.
+neighbor_hooks = model.make_neighbor_hooks()
 
 
 # %%
@@ -184,7 +182,8 @@ fire_opt = FIRE(
         ]
     ),
 )
-fire_opt.register_hook(neighbor_hook)
+for hook in neighbor_hooks:
+    fire_opt.register_hook(hook, stage=DynamicsStage.BEFORE_COMPUTE)
 
 # LoggingHook records energy, fmax, and status per graph to a CSV file.
 # The context manager starts the background I/O thread and flushes on exit.

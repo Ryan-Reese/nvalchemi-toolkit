@@ -250,6 +250,14 @@ print(
 # Batch — Append and append_data
 # -------------------------------
 
+# ``extra`` only carries the default atomic fields. It does not contain the
+# custom ``node_feat`` or ``temperature`` keys added above. Current
+# ``Batch.append()`` behavior keeps only the intersection of keys present in
+# both batches within each shared storage group, so custom keys missing from
+# the appended batch are dropped from the combined batch. The later round-trip
+# section therefore reports ``node_feat=False`` by design: the key is already
+# gone before ``to_data_list()`` runs.
+
 extra = Batch.from_data_list(
     [
         AtomicData(
@@ -259,6 +267,10 @@ extra = Batch.from_data_list(
 )
 batch.append(extra)
 print(f"After append: num_graphs={batch.num_graphs}")
+print(
+    f"'node_feat' survived append: {'node_feat' in batch}"
+    "  (expected: False — extra batch lacks it)"
+)
 
 batch.append_data(
     [
@@ -269,6 +281,14 @@ batch.append_data(
 )
 print(
     f"After append_data: num_graphs={batch.num_graphs}, num_nodes_list={batch.num_nodes_list}"
+)
+
+# Re-add node_feat (dropped by append) so the round-trip check at the end
+# can demonstrate that custom properties survive to_data_list → from_data_list.
+batch.add_key(
+    "node_feat",
+    [torch.randn(n, 4) for n in batch.num_nodes_list],
+    level="node",
 )
 
 # %%
@@ -365,7 +385,10 @@ print(f"num_neighbors: {periodic_batch.num_neighbors.tolist()}")
 # %%
 # Round-trip summary
 # ------------------
-
+#
+# ``to_data_list()`` preserves the current batch state faithfully. Since
+# ``node_feat`` was dropped earlier by ``append()`` when we added graphs that
+# did not carry that key, it is expected to remain absent after the round-trip.
 reconstructed = batch.to_data_list()
 batch_again = Batch.from_data_list(reconstructed)
 print(

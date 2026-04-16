@@ -34,8 +34,19 @@ Usage
 
 Notes
 -----
-* Forces are computed **analytically** inside the Warp kernel (not via
-  autograd), so ``"forces"`` is NOT in ``autograd_outputs``.
+* Forces are computed **analytically** inside the Warp kernel using
+  ``hybrid_forces=True``.  Direct kernel forces represent ``dE/dR|_q``
+  (derivative at fixed charges).  ``"forces"`` is in ``autograd_outputs``
+  so that the pipeline can add the charge chain-rule term
+  ``(dE/dq)(dq/dR)`` via autograd on the energy.
+* Energy supports ``backward()`` through the charge pathway: when
+  ``charges.requires_grad``, the kernel injects analytical ``dE/dq``
+  into the energy tensor via ``_InjectChargeGrad``.
+* Virial/stress is also computed analytically by the kernel and returned
+  detached (no ``grad_fn``), representing ``dE/d(strain)|_q``.  In a
+  pipeline with geometry-dependent charges, the total stress is the sum
+  of the direct kernel virial and the autograd chain-rule term
+  ``(dE/dq)(dq/d(strain))``.
 * Periodic boundary conditions are **required** (``needs_pbc=True``).
 * Input charges are read from ``data.charges`` (shape ``[N]``).
 * The Coulomb constant defaults to ``14.3996`` eV·Å/e², which gives energies
@@ -57,7 +68,6 @@ from torch import nn
 
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.data import AtomicData, Batch
-from nvalchemi.models._ops.neighbor_filter import prepare_neighbors_for_model
 from nvalchemi.models.base import (
     BaseModelMixin,
     ModelConfig,
@@ -99,16 +109,19 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
     coulomb_constant : float, optional
         Coulomb prefactor :math:`k_e` in eV·Å/e².
         Defaults to ``14.3996`` (standard value for Å/e/eV unit system).
-    max_neighbors : int, optional
-        Maximum neighbors per atom for the dense neighbor matrix.
-        Defaults to 256.
 
     Attributes
     ----------
     model_config : ModelConfig
         Mutable configuration controlling which outputs are computed.
-        Include ``"stress"`` in ``model_config.active_outputs`` to enable
-        virial computation for NPT/NPH simulations.
+        ``model_config.autograd_outputs`` includes ``"forces"`` so the
+        pipeline accumulates direct kernel forces with charge-path autograd
+        forces in hybrid mode. Include ``"stress"`` in
+        ``model_config.active_outputs`` to enable virial computation for
+        NPT/NPH simulations.
+        When ``charges.requires_grad=True``, ``energy.backward()`` propagates
+        through the injected :math:`dE/dq` pathway while the wrapper returns
+        detached direct kernel forces and detached virial/stress.
     """
 
     def __init__(
@@ -120,7 +133,7 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
         alpha: float | None = None,
         accuracy: float = 1e-6,
         coulomb_constant: float = 14.3996,
-        max_neighbors: int | None = None,
+        hybrid_forces: bool = True,
     ) -> None:
         super().__init__()
         self.cutoff = cutoff
@@ -130,10 +143,13 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
         self.alpha = alpha
         self.accuracy = accuracy
         self.coulomb_constant = coulomb_constant
-        self.max_neighbors = max_neighbors
+        self.hybrid_forces = hybrid_forces
         self.model_config = ModelConfig(
             outputs=frozenset({"energy", "forces", "stress"}),
-            autograd_outputs=frozenset(),
+            active_outputs={"energy", "forces"},
+            autograd_outputs=frozenset({"forces"})
+            if hybrid_forces
+            else frozenset({"forces", "stress"}),
             autograd_inputs=frozenset({"positions"}),
             required_inputs=frozenset({"charges"}),
             optional_inputs=frozenset(),
@@ -143,7 +159,6 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
                 cutoff=self.cutoff,
                 format=NeighborListFormat.MATRIX,
                 half_list=False,
-                max_neighbors=self.max_neighbors,
             ),
         )
 
@@ -174,6 +189,17 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
         self, data: AtomicData | Batch, **kwargs: Any
     ) -> AtomicData | Batch:
         raise NotImplementedError("PMEModelWrapper does not produce embeddings.")
+
+    def direct_derivative_keys(self) -> set[str]:
+        """Analytical force/stress keys when ``hybrid_forces=True``."""
+        if not self.hybrid_forces:
+            return set()
+        keys: set[str] = set()
+        if "forces" in self.model_config.outputs:
+            keys.add("forces")
+        if "stress" in self.model_config.outputs:
+            keys.add("stress")
+        return keys
 
     # ------------------------------------------------------------------
     # Input / output key declarations
@@ -264,12 +290,6 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
                 raise KeyError(f"'{key}' required but not found in input data.")
             input_dict[key] = value
 
-        # charges is stored as (N, 1) in AtomicData to satisfy the Pydantic
-        # model shape requirements; the kernel expects shape (N,).
-        charges = input_dict["charges"]
-        if charges.dim() == 2 and charges.shape[-1] == 1:
-            input_dict["charges"] = charges.squeeze(-1)
-
         input_dict["batch_idx"] = data.batch_idx.to(torch.int32)
         input_dict["ptr"] = data.batch_ptr.to(torch.int32)
         input_dict["num_graphs"] = data.num_graphs
@@ -284,14 +304,11 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
                 "(data.cell must be present)."
             )
 
-        # Collect neighbor tensors.
-        neighbor_dict = prepare_neighbors_for_model(
-            data, self.cutoff, NeighborListFormat.MATRIX, data.num_nodes
-        )
-        input_dict["neighbor_matrix"] = neighbor_dict["neighbor_matrix"]
-        input_dict["num_neighbors"] = neighbor_dict["num_neighbors"]
-        input_dict["neighbor_matrix_shifts"] = neighbor_dict.get(
-            "neighbor_matrix_shifts", None
+        # neighbor_matrix and num_neighbors are already collected by the
+        # input_data() loop above.  In a pipeline, the pipeline adapts them
+        # to this model's cutoff/format before calling forward().
+        input_dict["neighbor_matrix_shifts"] = getattr(
+            data, "neighbor_matrix_shifts", None
         )
 
         return input_dict
@@ -309,6 +326,10 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
         if "stress" in self.model_config.active_outputs:
             if "stress" in model_output:
                 output["stress"] = model_output["stress"]
+            else:
+                raise RuntimeError(
+                    "'stress' is in active_outputs but missing from model output"
+                )
         return output
 
     def output_data(self) -> set[str]:
@@ -339,8 +360,8 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
         ModelOutputs
             OrderedDict with keys ``"energy"`` (shape ``[B, 1]``, eV),
             ``"forces"`` (shape ``[N, 3]``, eV/Å), and optionally
-            ``"stress"`` (shape ``[B, 3, 3]``, eV — the raw virial
-            :math:`W_{phys}`).
+            ``"stress"`` (shape ``[B, 3, 3]``, eV/Å³ — Cauchy stress
+            ``W/V``).
         """
         from nvalchemiops.torch.interactions.electrostatics.pme import (  # lazy
             particle_mesh_ewald,
@@ -359,6 +380,15 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
 
         compute_forces = "forces" in self.model_config.active_outputs
         compute_stresses = "stress" in self.model_config.active_outputs
+
+        # hybrid_forces=True: the kernel detaches positions and cell
+        # internally and computes analytical forces/virial without a Warp
+        # tape.  Detach here too so that nvalchemiops' backward registration
+        # (_register_runtime_state) does not expect a tape when inputs have
+        # requires_grad=True (e.g. from prepare_strain in a pipeline).
+        if self.hybrid_forces:
+            positions = positions.detach()
+            cell = cell.detach()
 
         # Automatically invalidate cache when cell changes (e.g. NPT simulation).
         if self._cached_cell is None or not torch.allclose(
@@ -419,6 +449,7 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
             compute_forces=compute_forces,
             compute_virial=compute_stresses,
             accuracy=self.accuracy,
+            hybrid_forces=self.hybrid_forces,
         )
 
         # Unpack tuple: (energies, [forces], [virial]).
@@ -472,9 +503,13 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
         if forces is not None:
             model_output["forces"] = forces
         if virial is not None:
-            # particle_mesh_ewald accumulates W = Σ r_ij ⊗ F_ij (positive convention).
-            # Store directly as stresses (W_phys) — the barostat divides by V.
-            model_output["stress"] = virial
+            # Cauchy stress sigma = W/V (eV/A^3).
+            volume = torch.det(data.cell).abs().view(-1, 1, 1)
+            model_output["stress"] = virial / volume
+        elif compute_stresses:
+            raise RuntimeError(
+                "stress was requested but the kernel did not return a virial"
+            )
 
         return self.adapt_output(model_output, data)
 

@@ -79,11 +79,8 @@ from nvalchemi.models.ewald import EwaldModelWrapper
 # computed once and reused.
 
 CUTOFF = 10.0  # Å — real-space cutoff
-model = EwaldModelWrapper(cutoff=CUTOFF, accuracy=1e-6, max_neighbors=256)
-model.model_config.active_outputs = {
-    "energy",
-    "forces",
-}  # Remove stress, we don't need it for this example
+model = EwaldModelWrapper(cutoff=CUTOFF, accuracy=1e-6)
+# active_outputs defaults to {"energy", "forces"} — no change needed here.
 
 # %%
 # Building a NaCl rock-salt supercell
@@ -150,7 +147,16 @@ atomic_numbers = torch.cat(
         torch.full((n_cl,), 17, dtype=torch.long),
     ]
 )
-charges = torch.cat([torch.ones(n_na, 1), -torch.ones(n_cl, 1)])  # (N, 1)
+charges = torch.cat(
+    [
+        torch.ones(
+            n_na,
+        ),
+        -torch.ones(
+            n_cl,
+        ),
+    ]
+)  # (N,)
 
 cell = torch.eye(3).unsqueeze(0) * cell_size  # (1, 3, 3)
 

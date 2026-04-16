@@ -59,12 +59,13 @@ import torch
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.dynamics import NVTLangevin
+from nvalchemi.dynamics._units import fs_to_internal_time
 from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
 
 # KB_EV and kinetic_energy_per_graph are internal helpers used by the built-in
 # integrators.  A stable public re-export may be added in a future release.
 from nvalchemi.dynamics.hooks._utils import KB_EV, kinetic_energy_per_graph
-from nvalchemi.hooks import HookContext, NeighborListHook
+from nvalchemi.hooks import HookContext
 from nvalchemi.models.lj import LennardJonesModelWrapper
 
 logging.basicConfig(level=logging.INFO)
@@ -128,7 +129,7 @@ class VelocityRescalingThermostat(BaseDynamics):
     model : BaseModelMixin
         Neural network potential.
     dt : float
-        Integration timestep (simulation time units, e.g. fs).
+        Integration timestep in femtoseconds.
     temperature : float
         Target temperature in Kelvin.
     **kwargs
@@ -146,7 +147,7 @@ class VelocityRescalingThermostat(BaseDynamics):
         **kwargs,
     ) -> None:
         super().__init__(model=model, **kwargs)
-        self.dt = dt
+        self.dt = fs_to_internal_time(dt)
         self.temperature = temperature  # K
 
     def pre_update(self, batch: Batch) -> None:
@@ -222,7 +223,6 @@ model = LennardJonesModelWrapper(
     epsilon=LJ_EPSILON,
     sigma=LJ_SIGMA,
     cutoff=LJ_CUTOFF,
-    max_neighbors=32,
 )
 
 
@@ -283,11 +283,8 @@ integrator = VelocityRescalingThermostat(
     temperature=T_RESCALE,
     n_steps=n_steps,
 )
-integrator.register_hook(
-    NeighborListHook(
-        model.model_config.neighbor_config, stage=DynamicsStage.BEFORE_COMPUTE
-    )
-)
+for hook in model.make_neighbor_hooks():
+    integrator.register_hook(hook, stage=DynamicsStage.BEFORE_COMPUTE)
 integrator.register_hook(_TempLogger("VR", temps_rescaling, frequency=20))
 
 batch_vr = integrator.run(batch_vr)
@@ -317,11 +314,8 @@ langevin = NVTLangevin(
     n_steps=n_steps,
     random_seed=42,
 )
-langevin.register_hook(
-    NeighborListHook(
-        model.model_config.neighbor_config, stage=DynamicsStage.BEFORE_COMPUTE
-    )
-)
+for hook in model.make_neighbor_hooks():
+    langevin.register_hook(hook, stage=DynamicsStage.BEFORE_COMPUTE)
 langevin.register_hook(_TempLogger("NVT", temps_langevin, frequency=20))
 
 batch_nvt = langevin.run(batch_nvt)
@@ -420,7 +414,7 @@ class _SkeletonStatefulIntegrator(BaseDynamics):
 
     def __init__(self, model, dt: float, **kwargs) -> None:
         super().__init__(model=model, **kwargs)
-        self.dt = dt
+        self.dt = fs_to_internal_time(dt)
 
     def _init_state(self, batch: Batch) -> None:
         """Allocate per-system state from the first concrete batch."""

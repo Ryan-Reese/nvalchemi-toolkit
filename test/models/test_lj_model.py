@@ -112,16 +112,6 @@ class TestLennardJonesModelWrapperInit:
         )
         assert model.half_list is True
 
-    def test_stores_max_neighbors_default(self):
-        model = LennardJonesModelWrapper(epsilon=0.5, sigma=2.0, cutoff=6.0)
-        assert model.max_neighbors is None
-
-    def test_stores_max_neighbors_custom(self):
-        model = LennardJonesModelWrapper(
-            epsilon=0.5, sigma=2.0, cutoff=6.0, max_neighbors=64
-        )
-        assert model.max_neighbors == 64
-
     def test_atomic_energies_buf_is_none(self):
         model = _make_model()
         assert model._atomic_energies_buf is None
@@ -148,8 +138,8 @@ class TestLennardJonesModelWrapperInit:
 
     def test_model_config_active_outputs_stresses_default_true(self):
         model = _make_model()
-        # active_outputs defaults to outputs = {"energy", "forces", "stress"}
-        assert "stress" in model.model_config.active_outputs
+        # active_outputs defaults to outputs = {"energy", "forces"}
+        assert "stress" not in model.model_config.active_outputs
 
 
 # ---------------------------------------------------------------------------
@@ -387,10 +377,12 @@ class TestAdaptOutput:
             output["stress"] = torch.randn(1, 3, 3)
         return output
 
-    def test_energies_always_in_output(self):
+    def test_energies_always_in_output(
+        self,
+    ):
         model = _make_model()
         batch = _make_lj_batch()
-        result = model.adapt_output(self._model_output(), batch)
+        result = model.adapt_output(self._model_output(include_stresses=True), batch)
         assert "energy" in result
 
     def test_forces_in_output_when_compute_forces_true(self):
@@ -414,16 +406,20 @@ class TestAdaptOutput:
         result = model.adapt_output(self._model_output(include_virials=True), batch)
         assert "stress" not in result
 
-    def test_stresses_negated_virials_when_compute_stresses_true_and_virials_key(self):
+    def test_stresses_equal_virial_over_volume(self):
         model = _make_model()
         model.model_config.active_outputs = {"energy", "forces", "stress"}
         batch = _make_lj_batch()
+        # Add cell so volume can be computed.
+        batch.cell = torch.eye(3).unsqueeze(0)
+        batch.pbc = torch.ones(1, 3, dtype=torch.bool)
         virials = torch.randn(1, 3, 3)
         mo = self._model_output()
         mo["virial"] = virials
         result = model.adapt_output(mo, batch)
         assert "stress" in result
-        assert torch.allclose(result["stress"], -virials)
+        volume = torch.det(batch.cell).abs().view(-1, 1, 1)
+        assert torch.allclose(result["stress"], virials / volume)
 
     def test_stresses_is_stresses_when_no_virials_key(self):
         model = _make_model()
@@ -435,6 +431,25 @@ class TestAdaptOutput:
         result = model.adapt_output(mo, batch)
         assert "stress" in result
         assert torch.allclose(result["stress"], stresses)
+
+    def test_adapt_output_stress_raises_without_cell(self):
+        model = _make_model()
+        model.model_config.active_outputs = {"energy", "forces", "stress"}
+        batch = _make_lj_batch()  # no cell
+        mo = self._model_output()
+        mo["virial"] = torch.randn(1, 3, 3)
+        with pytest.raises(ValueError, match="stress output requires cell"):
+            model.adapt_output(mo, batch)
+
+    def test_adapt_output_stress_raises_when_missing(self):
+        """RuntimeError when stress is active but model_output has neither virial nor stress."""
+        model = _make_model()
+        model.model_config.active_outputs = {"energy", "forces", "stress"}
+        batch = _make_lj_batch()
+        batch.cell = torch.eye(3).unsqueeze(0)
+        mo = self._model_output()
+        with pytest.raises(RuntimeError, match="missing from model output"):
+            model.adapt_output(mo, batch)
 
 
 # ---------------------------------------------------------------------------

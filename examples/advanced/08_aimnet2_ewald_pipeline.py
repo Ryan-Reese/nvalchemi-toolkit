@@ -106,10 +106,14 @@ logging.basicConfig(level=logging.INFO)
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 N_MOLECULES = 5
 N_CLUSTERS = 10
-BOX_SIZE = 60.0  # Å — large enough for EWALD_CUTOFF < BOX_SIZE/2
+BOX_SIZE = 60.0  # Å — large box for sparse water clusters
+# NOTE: estimate_ewald_parameters may produce a real-space cutoff
+# larger than BOX_SIZE/2 for small/sparse systems.  The Ewald sum
+# remains correct — the real-space part simply sees all atoms.
 
 O_H_BOND = 0.96  # Å
 HALF_ANGLE = math.radians(104.5 / 2)
+MAX_DISPLACEMENT = 0.1  # Å — cap per-atom random displacement
 
 
 def _make_water_cluster(
@@ -137,7 +141,15 @@ def _make_water_cluster(
         atomic_numbers_list.extend([8, 1, 1])
 
     positions = torch.stack(positions_list)
-    positions = positions + distortion * torch.randn_like(positions)
+    # Clamp per-atom displacement to avoid atom collapse.
+    displacements = distortion * torch.randn_like(positions)
+    disp_norm = displacements.norm(dim=-1, keepdim=True)
+    scale = torch.where(
+        disp_norm > MAX_DISPLACEMENT,
+        MAX_DISPLACEMENT / disp_norm.clamp_min(1e-12),
+        torch.ones_like(disp_norm),
+    )
+    positions = positions + displacements * scale
     n_atoms = len(atomic_numbers_list)
 
     return AtomicData(
@@ -153,7 +165,7 @@ def _make_water_cluster(
 
 data_list = [
     _make_water_cluster(
-        N_MOLECULES, distortion=0.05 * (i + 1), seed=42 + i, box=BOX_SIZE
+        N_MOLECULES, distortion=0.25 * (i + 1), seed=42 + i, box=BOX_SIZE
     )
     for i in range(N_CLUSTERS)
 ]
@@ -166,15 +178,16 @@ print(
 # %%
 # Model setup: AIMNet2 + Ewald pipeline
 # ----------------------------------------
-aimnet2 = AIMNet2Wrapper.from_checkpoint("aimnet2_wb97m_d3_3", device=device)
+aimnet2 = AIMNet2Wrapper.from_checkpoint(
+    "aimnet2_wb97m_d3_3", device=device, compile_model=True
+)
 print(f"Loaded AIMNet2 on {device}")
 
 params = estimate_ewald_parameters(batch.positions, batch.cell, batch.batch_idx)
 ewald = EwaldModelWrapper(
-    cutoff=params.reciprocal_space_cutoff.max(),
-    accuracy=1e-6,
-    max_neighbors=256,
+    cutoff=params.real_space_cutoff.max(), accuracy=1e-6, hybrid_forces=False
 )
+# ewald.set_config("active_outputs", {"energy", "forces", "stress",})
 
 # Build the pipeline.  AIMNet2 outputs "charges" which Ewald requires as
 # input — the names match so no explicit wire mapping is needed.
@@ -186,9 +199,10 @@ pipe = PipelineModelWrapper(
         ),
     ]
 )
-
+pipe.set_config("active_outputs", {"energy", "forces", "stress", "charge"})
 print(f"\nPipeline: {[type(m).__name__ for m in pipe._models]}")
-print(f"  Outputs: {sorted(pipe.model_config.outputs)}")
+print(f"  Output Capabilities: {sorted(pipe.model_config.outputs)}")
+print(f"  Active Outputs: {sorted(pipe.model_config.active_outputs)}")
 
 
 # %%
@@ -197,8 +211,6 @@ print(f"  Outputs: {sorted(pipe.model_config.outputs)}")
 
 FMAX_THRESHOLD = 0.05  # eV/Å
 MAX_STEPS = 300
-
-pipe.model_config.active_outputs = {"energy", "forces"}
 
 optimizer = FIRE2(
     model=pipe,

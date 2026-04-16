@@ -659,7 +659,6 @@ class TestPipelineModelConfigSynthesis:
                     neighbor_config=NeighborConfig(
                         cutoff=5.0,
                         format=NeighborListFormat.MATRIX,
-                        max_neighbors=64,
                     ),
                     active_outputs={"energy", "forces"},
                 )
@@ -748,6 +747,294 @@ class TestPipelineNeighborHooks:
         )
         hooks = pipe.make_neighbor_hooks()
         assert len(hooks) == 1
+
+
+# ===========================================================================
+# Neighbor adaptation tests
+# ===========================================================================
+
+
+def _make_neighbor_batch():
+    """Build a 1-system, 4-atom batch with MATRIX neighbor data.
+
+    Positions along x-axis: 0, 1, 3, 7.
+    At cutoff 10 (pipeline): atom 0 sees 1(d=1), 2(d=3), 3(d=7);
+                              atom 1 sees 0(d=1), 2(d=2), 3(d=6);
+                              atom 2 sees 0(d=3), 1(d=2), 3(d=4);
+                              atom 3 sees 0(d=7), 1(d=6), 2(d=4).
+    At cutoff 4 (tight model): only pairs with d<=4 survive.
+    """
+    data = AtomicData(
+        positions=torch.tensor(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [3.0, 0.0, 0.0], [7.0, 0.0, 0.0]],
+        ),
+        atomic_numbers=torch.tensor([1, 1, 1, 1]),
+        forces=torch.zeros(4, 3),
+        energy=torch.zeros(1, 1),
+    )
+    batch = Batch.from_data_list([data])
+    N = batch.num_nodes  # 4
+    K = 3
+    # Full neighbor matrix at cutoff 10 — every atom sees all others.
+    nm = torch.tensor(
+        [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]],
+        dtype=torch.int32,
+    )
+    nn_ = torch.tensor([3, 3, 3, 3], dtype=torch.int32)
+    shifts = torch.zeros(N, K, 3, dtype=torch.int32)
+
+    object.__setattr__(batch, "neighbor_matrix", nm)
+    object.__setattr__(batch, "num_neighbors", nn_)
+    object.__setattr__(batch, "neighbor_matrix_shifts", shifts)
+    object.__setattr__(batch, "_neighbor_list_cutoff", 10.0)
+    return batch
+
+
+class _CaptureMixin:
+    """Mixin that records what neighbor data the model sees during forward()."""
+
+    def forward(self, data, **kwargs):
+        self.captured_neighbor_matrix = getattr(data, "neighbor_matrix", None)
+        self.captured_num_neighbors = getattr(data, "num_neighbors", None)
+        self.captured_neighbor_list = getattr(data, "neighbor_list", None)
+        self.captured_edge_ptr = getattr(data, "edge_ptr", None)
+        self.captured_cutoff = getattr(data, "_neighbor_list_cutoff", None)
+        # Clone tensors so they survive the pipeline's restore step.
+        for attr in (
+            "captured_neighbor_matrix",
+            "captured_num_neighbors",
+            "captured_neighbor_list",
+            "captured_edge_ptr",
+        ):
+            val = getattr(self, attr, None)
+            if val is not None:
+                setattr(self, attr, val.clone())
+        return super().forward(data, **kwargs)
+
+
+class _MatrixModel10(_CaptureMixin, MockEnergyForceModel):
+    """MATRIX model at cutoff 10 — matches the pipeline's cutoff exactly."""
+
+    def __init__(self):
+        super().__init__()
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy", "forces"}),
+            needs_pbc=False,
+            neighbor_config=NeighborConfig(
+                cutoff=10.0,
+                format=NeighborListFormat.MATRIX,
+            ),
+            active_outputs={"energy", "forces"},
+        )
+
+
+class _MatrixModel4(_CaptureMixin, MockEnergyForceModel):
+    """MATRIX model at cutoff 4 — tighter than the pipeline's cutoff."""
+
+    def __init__(self):
+        super().__init__()
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy", "forces"}),
+            needs_pbc=False,
+            neighbor_config=NeighborConfig(
+                cutoff=4.0,
+                format=NeighborListFormat.MATRIX,
+            ),
+            active_outputs={"energy", "forces"},
+        )
+
+
+class _COOModel4(_CaptureMixin, MockEnergyForceModel):
+    """COO model at cutoff 4 — needs both format conversion AND filtering."""
+
+    def __init__(self):
+        super().__init__()
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy", "forces"}),
+            needs_pbc=False,
+            neighbor_config=NeighborConfig(
+                cutoff=4.0,
+                format=NeighborListFormat.COO,
+            ),
+            active_outputs={"energy", "forces"},
+        )
+
+
+class TestPipelineNeighborAdaptation:
+    """Verify that sub-models receive correctly adapted neighbor data."""
+
+    def test_same_cutoff_no_filtering(self):
+        """Model at pipeline cutoff receives the original neighbor matrix."""
+        model = _MatrixModel10()
+        pipe = PipelineModelWrapper(
+            groups=[PipelineGroup(steps=[model])],
+        )
+        batch = _make_neighbor_batch()
+        orig_nm = batch.neighbor_matrix.clone()
+        pipe(batch)
+
+        assert model.captured_neighbor_matrix is not None
+        torch.testing.assert_close(model.captured_neighbor_matrix, orig_nm)
+        # All atoms still see 3 neighbors each.
+        assert (model.captured_num_neighbors == 3).all()
+
+    def test_tighter_cutoff_filters_matrix(self):
+        """Model at cutoff=4 should not see neighbors beyond distance 4.
+
+        With positions [0, 1, 3, 7] and cutoff 4:
+          atom 0: sees 1(d=1), 2(d=3)       → 2 neighbors
+          atom 1: sees 0(d=1), 2(d=2)       → 2 neighbors
+          atom 2: sees 0(d=3), 1(d=2), 3(d=4) → d=4 is NOT < 4 → 2 neighbors
+          atom 3: sees 2(d=4) → NOT < 4     → 0 neighbors
+        """
+        wide = _MatrixModel10()
+        tight = _MatrixModel4()
+        pipe = PipelineModelWrapper(
+            groups=[PipelineGroup(steps=[wide, tight])],
+        )
+        batch = _make_neighbor_batch()
+        pipe(batch)
+
+        # Wide model sees all 3 neighbors per atom (unfiltered).
+        assert (wide.captured_num_neighbors == 3).all()
+
+        # Tight model sees filtered counts.
+        expected_nn = torch.tensor([2, 2, 2, 0], dtype=torch.int32)
+        torch.testing.assert_close(tight.captured_num_neighbors, expected_nn)
+
+        # Verify no neighbor index in the tight result is atom 3 for atoms 0,1
+        # (distances 7 and 6, both > 4).
+        nm = tight.captured_neighbor_matrix
+        fill = 4  # num_nodes
+        for atom_idx in [0, 1]:
+            valid = nm[atom_idx][nm[atom_idx] < fill]
+            assert 3 not in valid.tolist(), (
+                f"atom {atom_idx} should not see atom 3 at cutoff 4"
+            )
+
+    def test_matrix_to_coo_conversion(self):
+        """COO model in a MATRIX pipeline receives converted neighbor list."""
+        matrix_model = _MatrixModel10()
+        coo_model = _COOModel4()
+        pipe = PipelineModelWrapper(
+            groups=[PipelineGroup(steps=[matrix_model, coo_model])],
+        )
+        batch = _make_neighbor_batch()
+        pipe(batch)
+
+        # Matrix model sees MATRIX data.
+        assert matrix_model.captured_neighbor_matrix is not None
+        assert matrix_model.captured_neighbor_list is None
+
+        # COO model sees COO data (neighbor_list set by pipeline).
+        assert coo_model.captured_neighbor_list is not None
+        nl = coo_model.captured_neighbor_list  # (E, 2)
+        assert nl.ndim == 2 and nl.shape[1] == 2
+
+        # All edges must be within cutoff 4.
+        positions = batch.positions
+        for e in range(nl.shape[0]):
+            i, j = int(nl[e, 0]), int(nl[e, 1])
+            dist = (positions[i] - positions[j]).norm().item()
+            assert dist < 4.0, f"edge ({i},{j}) dist={dist:.2f} exceeds cutoff 4"
+
+    def test_batch_restored_after_forward(self):
+        """Pipeline must restore the original neighbor data after forward."""
+        wide = _MatrixModel10()
+        tight = _MatrixModel4()
+        pipe = PipelineModelWrapper(
+            groups=[PipelineGroup(steps=[wide, tight])],
+        )
+        batch = _make_neighbor_batch()
+        orig_nm = batch.neighbor_matrix.clone()
+        orig_nn = batch.num_neighbors.clone()
+        orig_cutoff = batch._neighbor_list_cutoff
+
+        pipe(batch)
+
+        torch.testing.assert_close(batch.neighbor_matrix, orig_nm)
+        torch.testing.assert_close(batch.num_neighbors, orig_nn)
+        assert batch._neighbor_list_cutoff == orig_cutoff
+        # COO attributes should not leak onto the batch.
+        assert "neighbor_list" not in batch.__dict__
+
+    def test_matrix_k_dimension_trimmed(self):
+        """Filtered MATRIX must have K trimmed to actual max neighbors.
+
+        Without trimming, a matrix built at 80 Å (K=430k) would be passed
+        intact to a 5 Å model — correct but extremely wasteful.
+        """
+        wide = _MatrixModel10()
+        tight = _MatrixModel4()
+        pipe = PipelineModelWrapper(
+            groups=[PipelineGroup(steps=[wide, tight])],
+        )
+        batch = _make_neighbor_batch()
+        orig_k = batch.neighbor_matrix.shape[1]  # K=3
+        pipe(batch)
+
+        # Wide model at pipeline cutoff: same K (no adaptation needed).
+        assert wide.captured_neighbor_matrix.shape[1] == orig_k
+
+        # Tight model: max num_neighbors is 2, so K should be trimmed to 2.
+        assert tight.captured_neighbor_matrix.shape[1] == 2
+
+    def test_storage_backed_neighbor_data(self):
+        """Adaptation works when neighbor data is in Batch._storage (not __dict__).
+
+        This is the real-world path: compute_neighbors writes to _storage
+        via atoms_group['neighbor_matrix']. The pipeline must shadow it
+        in __dict__ for the sub-model to see adapted data.
+        """
+        data = AtomicData(
+            positions=torch.tensor(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [3.0, 0.0, 0.0], [7.0, 0.0, 0.0]],
+            ),
+            atomic_numbers=torch.tensor([1, 1, 1, 1]),
+            forces=torch.zeros(4, 3),
+            energy=torch.zeros(1, 1),
+            cell=torch.eye(3).unsqueeze(0) * 20.0,
+            pbc=torch.tensor([[True, True, True]]),
+        )
+        batch = Batch.from_data_list([data])
+
+        from nvalchemi.neighbors import compute_neighbors
+
+        compute_neighbors(batch, cutoff=10.0)
+
+        # Verify data is in _storage, NOT __dict__
+        assert "neighbor_matrix" not in batch.__dict__
+        assert "neighbor_matrix" in batch._storage
+
+        tight = _MatrixModel4()
+        wide = _MatrixModel10()
+        pipe = PipelineModelWrapper(
+            groups=[PipelineGroup(steps=[tight, wide])],
+        )
+        pipe(batch)
+
+        # Tight model should see filtered + trimmed matrix.
+        assert tight.captured_neighbor_matrix is not None
+        max_nn = int(tight.captured_num_neighbors.max())
+        assert tight.captured_neighbor_matrix.shape[1] == max_nn
+
+        # Wide model at pipeline cutoff should see original (unfiltered).
+        assert wide.captured_neighbor_matrix is not None
+        assert wide.captured_neighbor_matrix.shape == batch.neighbor_matrix.shape
+
+    def test_coo_attrs_removed_after_forward(self):
+        """COO attributes set for a COO sub-model must not persist on the batch."""
+        coo_model = _COOModel4()
+        matrix_model = _MatrixModel10()
+        pipe = PipelineModelWrapper(
+            groups=[PipelineGroup(steps=[coo_model, matrix_model])],
+        )
+        batch = _make_neighbor_batch()
+        pipe(batch)
+
+        # neighbor_list was temporarily added for coo_model, must be gone.
+        assert "neighbor_list" not in batch.__dict__
+        assert "edge_ptr" not in batch.__dict__
 
 
 # ===========================================================================
@@ -1013,9 +1300,7 @@ class TestPipelineCompile:
         )
         data.add_node_property("velocities", torch.zeros(n_atoms, 3))
 
-        lj = LennardJonesModelWrapper(
-            epsilon=0.0104, sigma=3.40, cutoff=8.5, max_neighbors=32
-        )
+        lj = LennardJonesModelWrapper(epsilon=0.0104, sigma=3.40, cutoff=8.5)
         batch = Batch.from_data_list([data], device=device)
         batch["stress"] = torch.zeros(1, 3, 3, device=device)
 
@@ -1430,3 +1715,256 @@ class TestPipelineAutogradCorrectness:
 
         expected_energy = e_a + e_b
         torch.testing.assert_close(out["energy"], expected_energy, atol=1e-10, rtol=0)
+
+
+# ===========================================================================
+# Hybrid forces: direct + autograd force summation in autograd groups
+# ===========================================================================
+
+
+class _MockHybridForcesModel(nn.Module, BaseModelMixin):
+    """Mock model mimicking hybrid_forces behavior.
+
+    Returns direct forces (no grad_fn) and energy with grad_fn through
+    a "charge" pathway, similar to Ewald/PME with hybrid_forces=True.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy", "forces"}),
+            autograd_outputs=frozenset({"forces"}),
+            autograd_inputs=frozenset({"positions"}),
+            needs_pbc=False,
+            active_outputs={"energy", "forces"},
+        )
+
+    @property
+    def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
+        return {}
+
+    def compute_embeddings(self, data, **kwargs):
+        raise NotImplementedError
+
+    def forward(self, data, **kwargs) -> ModelOutputs:
+        positions = data.positions
+        B = data.num_graphs if isinstance(data, Batch) else 1
+        batch_idx = (
+            data.batch_idx
+            if isinstance(data, Batch)
+            else torch.zeros(positions.shape[0], dtype=torch.long)
+        )
+        # "Charges" derived from positions (simulates q(R))
+        charges = positions.sum(dim=-1)
+        # Energy depends on charges (not directly on positions)
+        per_atom_e = charges**2
+        energies = torch.zeros(B, 1, dtype=positions.dtype, device=positions.device)
+        energies.scatter_add_(0, batch_idx.unsqueeze(-1), per_atom_e.unsqueeze(-1))
+        # Direct forces: partial derivative dE/dR|_q (detached, no grad_fn)
+        direct_forces = (
+            -2.0 * charges.unsqueeze(-1).detach() * torch.ones_like(positions)
+        )
+        return OrderedDict(energy=energies, forces=direct_forces.detach())
+
+
+class _MockChargePathEnergyOnlyModel(nn.Module, BaseModelMixin):
+    """Mock model with the same charge-path energy but no direct forces."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy"}),
+            autograd_outputs=frozenset({"forces"}),
+            autograd_inputs=frozenset({"positions"}),
+            needs_pbc=False,
+            active_outputs={"energy"},
+        )
+
+    @property
+    def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
+        return {}
+
+    def compute_embeddings(self, data, **kwargs):
+        raise NotImplementedError
+
+    def forward(self, data, **kwargs) -> ModelOutputs:
+        positions = data.positions
+        B = data.num_graphs if isinstance(data, Batch) else 1
+        batch_idx = (
+            data.batch_idx
+            if isinstance(data, Batch)
+            else torch.zeros(positions.shape[0], dtype=torch.long)
+        )
+        charges = positions.sum(dim=-1)
+        per_atom_e = charges**2
+        energies = torch.zeros(B, 1, dtype=positions.dtype, device=positions.device)
+        energies.scatter_add_(0, batch_idx.unsqueeze(-1), per_atom_e.unsqueeze(-1))
+        return OrderedDict(energy=energies)
+
+
+class _MockHybridForcesStressModel(nn.Module, BaseModelMixin):
+    """Mock model mimicking hybrid_forces behavior with stress output.
+
+    Returns direct forces and stress (no grad_fn) and energy with grad_fn
+    through a "charge" pathway, similar to Ewald/PME with hybrid_forces=True.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy", "forces", "stress"}),
+            autograd_outputs=frozenset({"forces"}),
+            autograd_inputs=frozenset({"positions"}),
+            needs_pbc=False,
+            active_outputs={"energy", "forces", "stress"},
+        )
+
+    @property
+    def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
+        return {}
+
+    def compute_embeddings(self, data, **kwargs):
+        raise NotImplementedError
+
+    def forward(self, data, **kwargs) -> ModelOutputs:
+        positions = data.positions
+        B = data.num_graphs if isinstance(data, Batch) else 1
+        batch_idx = (
+            data.batch_idx
+            if isinstance(data, Batch)
+            else torch.zeros(positions.shape[0], dtype=torch.long)
+        )
+        charges = positions.sum(dim=-1)
+        per_atom_e = charges**2
+        energies = torch.zeros(B, 1, dtype=positions.dtype, device=positions.device)
+        energies.scatter_add_(0, batch_idx.unsqueeze(-1), per_atom_e.unsqueeze(-1))
+        direct_forces = (
+            -2.0 * charges.unsqueeze(-1).detach() * torch.ones_like(positions)
+        )
+        direct_stress = (
+            torch.eye(3, dtype=positions.dtype, device=positions.device)
+            .unsqueeze(0)
+            .expand(B, -1, -1)
+            * 0.5
+        )
+        return OrderedDict(
+            energy=energies,
+            forces=direct_forces.detach(),
+            stress=direct_stress.detach(),
+        )
+
+
+class TestAutoGradGroupHybridForces:
+    """Test that _run_autograd_group sums direct + autograd forces."""
+
+    @pytest.fixture
+    def single_batch(self):
+        data = AtomicData(
+            positions=torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            atomic_numbers=torch.tensor([6, 8]),
+            forces=torch.zeros(2, 3),
+            energy=torch.zeros(1, 1),
+        )
+        return Batch.from_data_list([data])
+
+    def test_direct_forces_added_to_autograd_forces(self, single_batch):
+        """Autograd group sums direct kernel forces with autograd forces."""
+        model = _MockHybridForcesModel()
+        pipe = PipelineModelWrapper(
+            groups=[PipelineGroup(steps=[model], use_autograd=True)]
+        )
+        pipe.model_config.active_outputs = {"energy", "forces"}
+        out = pipe(single_batch)
+        charges = single_batch.positions.sum(dim=-1, keepdim=True)
+        expected_forces = -4.0 * charges.expand_as(single_batch.positions)
+
+        assert "forces" in out
+        torch.testing.assert_close(out["forces"], expected_forces)
+
+    def test_energy_only_model_forces_from_autograd_alone(self, single_batch):
+        """When model returns energy only, forces come from autograd alone."""
+        model = MockAutogradEnergyModel(scale=1.0)
+        pipe = PipelineModelWrapper(
+            groups=[PipelineGroup(steps=[model], use_autograd=True)]
+        )
+        pipe.model_config.active_outputs = {"energy", "forces"}
+        out = pipe(single_batch)
+        expected_forces = -2.0 * single_batch.positions
+
+        assert "forces" in out
+        torch.testing.assert_close(out["forces"], expected_forces)
+
+    def test_hybrid_forces_greater_than_autograd_alone(self, single_batch):
+        """Hybrid total forces should equal autograd plus direct forces."""
+        model = _MockHybridForcesModel()
+        pipe = PipelineModelWrapper(
+            groups=[PipelineGroup(steps=[model], use_autograd=True)]
+        )
+        pipe.model_config.active_outputs = {"energy", "forces"}
+        out_hybrid = pipe(single_batch)
+
+        pipe2 = PipelineModelWrapper(
+            groups=[
+                PipelineGroup(
+                    steps=[_MockChargePathEnergyOnlyModel()], use_autograd=True
+                )
+            ]
+        )
+        pipe2.model_config.active_outputs = {"energy", "forces"}
+        out_autograd_only = pipe2(single_batch)
+        charges = single_batch.positions.sum(dim=-1, keepdim=True)
+        expected_autograd_forces = -2.0 * charges.expand_as(single_batch.positions)
+        expected_direct_forces = expected_autograd_forces
+        expected_hybrid_forces = expected_autograd_forces + expected_direct_forces
+
+        torch.testing.assert_close(
+            out_autograd_only["forces"], expected_autograd_forces
+        )
+        torch.testing.assert_close(out_hybrid["forces"], expected_hybrid_forces)
+
+    def test_direct_stress_added_to_autograd_stress(self):
+        """Autograd group sums detached kernel stress with autograd stress."""
+        data = AtomicData(
+            positions=torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            atomic_numbers=torch.tensor([6, 8]),
+            forces=torch.zeros(2, 3),
+            energy=torch.zeros(1, 1),
+            cell=torch.eye(3).unsqueeze(0) * 10.0,
+            pbc=torch.tensor([[True, True, True]]),
+        )
+        batch = Batch.from_data_list([data])
+
+        # Run with the hybrid model (returns direct stress 0.5*I)
+        model = _MockHybridForcesStressModel()
+        pipe = PipelineModelWrapper(
+            groups=[PipelineGroup(steps=[model], use_autograd=True)]
+        )
+        pipe.model_config.active_outputs = {"energy", "forces", "stress"}
+        out_hybrid = pipe(batch)
+
+        assert "stress" in out_hybrid
+        assert out_hybrid["stress"].shape == (1, 3, 3)
+
+        # Run the energy-only model (no direct stress) with autograd stress
+        pipe_autograd = PipelineModelWrapper(
+            groups=[
+                PipelineGroup(
+                    steps=[_MockChargePathEnergyOnlyModel()], use_autograd=True
+                )
+            ]
+        )
+        pipe_autograd.model_config.active_outputs = {"energy", "forces", "stress"}
+        data2 = AtomicData(
+            positions=torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            atomic_numbers=torch.tensor([6, 8]),
+            forces=torch.zeros(2, 3),
+            energy=torch.zeros(1, 1),
+            cell=torch.eye(3).unsqueeze(0) * 10.0,
+            pbc=torch.tensor([[True, True, True]]),
+        )
+        batch2 = Batch.from_data_list([data2])
+        out_autograd = pipe_autograd(batch2)
+
+        direct_stress = 0.5 * torch.eye(3).unsqueeze(0)
+        expected = out_autograd["stress"] + direct_stress
+        torch.testing.assert_close(out_hybrid["stress"], expected, atol=1e-5, rtol=1e-5)
